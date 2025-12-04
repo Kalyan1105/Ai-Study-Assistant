@@ -1,6 +1,8 @@
 fastapi
-uvicorn[standard]
-tensorflow
-Pillow
-numpy
+uvicorn
+pypdf
+chromadb
+sentence-transformers
+groq
+python-dotenv
 python-multipart
