@@ -1,8 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pypdf
-chromadb
-sentence-transformers
+chromadb==0.5.0
+sentence-transformers==2.7.0
 groq
 python-dotenv
 python-multipart
