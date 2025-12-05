@@ -27,6 +27,7 @@ if not GROQ_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+# You can change this to any fastembed-supported model if needed
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
@@ -155,6 +156,9 @@ def add_documents_to_chroma(docs: List[Dict]):
 
 
 def query_study_notes(question: str, k: int = 5):
+    # Safety clamp for k to avoid weird behavior with very large values
+    k = max(1, min(int(k), 10))
+
     embedder = get_embedder()
 
     # Embed single question
@@ -162,16 +166,25 @@ def query_study_notes(question: str, k: int = 5):
 
     results = collection.query(query_embeddings=[q_emb], n_results=k)
 
-    if not results["documents"]:
+    # Be defensive about missing/empty fields
+    docs_list = results.get("documents") or [[]]
+    metas_list = results.get("metadatas") or [[]]
+    ids_list = results.get("ids") or [[]]
+
+    docs = docs_list[0] or []
+    metas = metas_list[0] or []
+    ids = ids_list[0] or []
+
+    if len(docs) == 0:
         return "I don't know based on these notes.", "", []
 
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    ids = results["ids"][0]
+    # Ensure we don't index past the shortest list
+    n = min(len(docs), len(metas), len(ids))
 
     context_parts = []
     chunks = []
-    for i, d in enumerate(docs):
+    for i in range(n):
+        d = docs[i]
         meta = metas[i]
         src = meta.get("source_file", "unknown")
         idx = meta.get("chunk_index", -1)
@@ -226,10 +239,19 @@ async def ask(req: AskRequest):
     """
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on the server."}
-    answer, context, chunks = query_study_notes(req.question, req.k)
-    return {
-        "question": req.question,
-        "answer": answer,
-        "context": context,
-        "chunks": chunks,
-    }
+
+    try:
+        k = max(1, min(int(req.k), 10))
+        answer, context, chunks = query_study_notes(req.question, k)
+        return {
+            "question": req.question,
+            "answer": answer,
+            "context": context,
+            "chunks": chunks,
+        }
+    except Exception as e:
+        # Return a clean JSON error instead of a 500 HTML page
+        return {
+            "error": "Backend exception while answering question.",
+            "detail": str(e),
+        }
