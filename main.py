@@ -7,9 +7,9 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from pypdf import PdfReader
+from PyPDF2 import PdfReader
 import chromadb
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -31,9 +31,12 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 @lru_cache
-def get_embedder() -> SentenceTransformer:
-    # Lazy-load model on first request to save memory at startup
-    return SentenceTransformer(EMBED_MODEL_NAME)
+def get_embedder() -> TextEmbedding:
+    """
+    Lazy-load the embedding model on first use.
+    fastembed uses ONNX CPU models (no torch/CUDA) → light & fast for Render.
+    """
+    return TextEmbedding(model_name=EMBED_MODEL_NAME)
 
 
 CHROMA_DIR = "./chroma_study_db"
@@ -50,7 +53,8 @@ def generate_answer(context: str, question: str) -> str:
     prompt = f"""
 You are a helpful AI study assistant for a CSE student.
 Answer ONLY using the context below.
-If answer not found, say exactly: "I don't know based on these notes."
+If the answer is not in the context, say exactly:
+"I don't know based on these notes."
 
 Context:
 {context}
@@ -61,7 +65,7 @@ Question: {question}
     resp = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[
-            {"role": "system", "content": "Study assistant"},
+            {"role": "system", "content": "You are a helpful study assistant."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
@@ -97,6 +101,7 @@ def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
         if not uploaded.filename.lower().endswith(".pdf"):
             continue
 
+        # Save uploaded file to a temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded.file.read())
             tmp_path = tmp.name
@@ -123,6 +128,7 @@ def reset_collection():
     try:
         client_chroma.delete_collection("study_notes")
     except Exception:
+        # If it doesn't exist yet, ignore
         pass
     global collection
     collection = client_chroma.get_or_create_collection(name="study_notes")
@@ -131,16 +137,29 @@ def reset_collection():
 def add_documents_to_chroma(docs: List[Dict]):
     if not docs:
         return
+
     texts = [d["text"] for d in docs]
     ids = [d["id"] for d in docs]
     metas = [d["metadata"] for d in docs]
 
-    embeddings = get_embedder().encode(texts, convert_to_numpy=True).tolist()
-    collection.add(documents=texts, ids=ids, metadatas=metas, embeddings=embeddings)
+    # fastembed returns a generator of numpy arrays → convert to list of lists
+    embedder = get_embedder()
+    embeddings = [vec.tolist() for vec in embedder.embed(texts)]
+
+    collection.add(
+        documents=texts,
+        ids=ids,
+        metadatas=metas,
+        embeddings=embeddings,
+    )
 
 
 def query_study_notes(question: str, k: int = 5):
-    q_emb = get_embedder().encode([question], convert_to_numpy=True).tolist()[0]
+    embedder = get_embedder()
+
+    # Embed single question
+    q_emb = next(embedder.embed([question])).tolist()
+
     results = collection.query(query_embeddings=[q_emb], n_results=k)
 
     if not results["documents"]:
@@ -191,6 +210,9 @@ async def health():
 
 @app.post("/build_index")
 async def build_index(files: List[UploadFile] = File(...)):
+    """
+    Upload one or more PDFs and build/update the Chroma index.
+    """
     reset_collection()
     docs = build_doc_chunks(files)
     add_documents_to_chroma(docs)
@@ -199,7 +221,15 @@ async def build_index(files: List[UploadFile] = File(...)):
 
 @app.post("/ask")
 async def ask(req: AskRequest):
+    """
+    Ask a question over the uploaded notes.
+    """
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on the server."}
     answer, context, chunks = query_study_notes(req.question, req.k)
-    return {"question": req.question, "answer": answer, "context": context, "chunks": chunks}
+    return {
+        "question": req.question,
+        "answer": answer,
+        "context": context,
+        "chunks": chunks,
+    }
