@@ -1,7 +1,6 @@
 numpy==1.26.4
 chromadb==0.4.22
-fastembed==0.4.2
-
+fastembed==0.7.4
 fastapi==0.123.9
 uvicorn==0.38.0
 python-dotenv==1.2.1
