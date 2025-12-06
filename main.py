@@ -3,12 +3,13 @@ import tempfile
 from functools import lru_cache
 from typing import List, Dict
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from PyPDF2 import PdfReader
-from PyPDF2.errors import DependencyError as PdfDependencyError, PdfReadError
+from PyPDF2.errors import PdfReadError, DependencyError
+
 import chromadb
 from fastembed import TextEmbedding
 from groq import Groq
@@ -28,7 +29,7 @@ if not GROQ_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# FastEmbed model (ONNX, CPU-friendly)
+# You can change this to another supported fastembed model if you want later.
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
@@ -41,10 +42,11 @@ def get_embedder() -> TextEmbedding:
     return TextEmbedding(model_name=EMBED_MODEL_NAME)
 
 
-# Chroma persistent DB (stored on Render disk)
 CHROMA_DIR = "./chroma_study_db"
 os.makedirs(CHROMA_DIR, exist_ok=True)
 client_chroma = chromadb.PersistentClient(path=CHROMA_DIR)
+
+# Single shared collection for now (multi-user aware design can come later)
 collection = client_chroma.get_or_create_collection(name="study_notes")
 
 
@@ -53,6 +55,9 @@ collection = client_chroma.get_or_create_collection(name="study_notes")
 # -------------------------
 
 def generate_answer(context: str, question: str) -> str:
+    """
+    Call Groq LLM with retrieved context + question.
+    """
     prompt = f"""
 You are a helpful AI study assistant for a CSE student.
 Answer ONLY using the context below.
@@ -79,60 +84,111 @@ Question: {question}
 
 def read_pdf(path: str) -> str:
     """
-    Extract full text from a PDF file using PyPDF2.
-
-    - If the PDF is encrypted and can't be decrypted (AES, password-protected, etc.),
-      we don't crash the app. We log and return empty text.
+    Read text from a PDF.
+    - Supports encrypted PDFs that don't require a user password (AES via pycryptodome).
+    - If the PDF is password protected, we raise a user-friendly error.
     """
     try:
         reader = PdfReader(path)
+    except PdfReadError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to read PDF: {e}",
+        )
 
-        # Handle encrypted PDFs
-        if reader.is_encrypted:
-            try:
-                # Many "encrypted" PDFs are decryptable with an empty password
-                decrypt_result = reader.decrypt("")
-                # decrypt_result can be 0/1/2; if 0, decryption failed
-                if decrypt_result == 0:
-                    print(f"[WARN] Encrypted PDF requires a password, skipping: {path}")
-                    return ""
-            except Exception as e:
-                print(f"[WARN] Could not decrypt encrypted PDF {path}: {e}")
-                return ""
+    # Handle encrypted PDFs
+    if reader.is_encrypted:
+        # Try with empty password (for some owner-protected PDFs)
+        try:
+            result = reader.decrypt("")
+        except Exception:
+            result = 0
 
-        pages = []
+        if result == 0:
+            # Proper password-protected PDF, we can't read it
+            raise HTTPException(
+                status_code=400,
+                detail="This PDF is password-protected. Please upload an unencrypted file.",
+            )
+
+    pages: List[str] = []
+    try:
         for p in reader.pages:
             text = p.extract_text() or ""
             pages.append(text)
-        return "\n".join(pages)
-
-    except (PdfDependencyError, PdfReadError) as e:
-        # DependencyError: PyCryptodome missing for AES (should be fixed by requirements)
-        # PdfReadError: Corrupted/unreadable PDFs
-        print(f"[ERROR] Could not read PDF {path}: {e}")
-        return ""
+    except DependencyError:
+        # pycryptodome missing or AES issue – but we already install pycryptodome
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to decrypt this PDF. Please try another file.",
+        )
     except Exception as e:
-        print(f"[ERROR] Unexpected error reading PDF {path}: {e}")
-        return ""
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error while reading the PDF: {e}",
+        )
+
+    text = "\n".join(pages).strip()
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not extract text from this PDF. It may be scanned images only.",
+        )
+
+    return text
 
 
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> List[str]:
+def chunk_text(text: str) -> List[str]:
+    """
+    Auto-chunking logic so the user doesn't have to tune anything.
+
+    Strategy:
+    - If the text is small, return 1 chunk.
+    - Otherwise, use a dynamic chunk size with overlap.
+    """
     words = text.split()
+    n = len(words)
+
+    if n == 0:
+        return []
+
+    # Heuristic: choose chunk size based on document length
+    if n <= 800:
+        # Small doc → one chunk
+        return [" ".join(words)]
+
+    if n <= 4000:
+        chunk_size = 500
+    else:
+        chunk_size = 800
+
+    overlap = int(chunk_size * 0.2)  # 20% overlap
     chunks = []
     start = 0
-    while start < len(words):
+    while start < n:
         end = start + chunk_size
         chunks.append(" ".join(words[start:end]))
         start += max(chunk_size - overlap, 1)
+
     return chunks
 
 
 def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
-    docs = []
+    """
+    Accept multiple PDFs, extract text, chunk them, and return list of chunk dicts.
+    """
+    docs: List[Dict] = []
     doc_id = 0
+
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail="No files uploaded. Please upload at least one PDF.",
+        )
+
     for uploaded in files:
         if not uploaded.filename.lower().endswith(".pdf"):
-            print(f"[INFO] Skipping non-PDF file: {uploaded.filename}")
+            # Skip non-PDFs instead of crashing
             continue
 
         # Save uploaded file to a temp file
@@ -141,12 +197,6 @@ def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
             tmp_path = tmp.name
 
         full_text = read_pdf(tmp_path)
-
-        # If PDF couldn't be read (encrypted/protected), skip it
-        if not full_text.strip():
-            print(f"[WARN] No text extracted from {uploaded.filename}, skipping.")
-            continue
-
         chunks = chunk_text(full_text)
 
         for idx, chunk in enumerate(chunks):
@@ -160,11 +210,23 @@ def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
                     },
                 }
             )
+
         doc_id += 1
+
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid text content found in the uploaded PDFs.",
+        )
+
     return docs
 
 
 def reset_collection():
+    """
+    Clear the Chroma collection.
+    You can call this before re-building everything from scratch.
+    """
     try:
         client_chroma.delete_collection("study_notes")
     except Exception:
@@ -176,15 +238,14 @@ def reset_collection():
 
 def add_documents_to_chroma(docs: List[Dict]):
     if not docs:
-        print("[WARN] No documents to add to Chroma (maybe all PDFs were unreadable).")
         return
 
     texts = [d["text"] for d in docs]
     ids = [d["id"] for d in docs]
     metas = [d["metadata"] for d in docs]
 
-    # fastembed returns a generator of numpy arrays → convert to list of lists
     embedder = get_embedder()
+    # fastembed returns a generator of numpy arrays → convert to list of lists
     embeddings = [vec.tolist() for vec in embedder.embed(texts)]
 
     collection.add(
@@ -193,11 +254,29 @@ def add_documents_to_chroma(docs: List[Dict]):
         metadatas=metas,
         embeddings=embeddings,
     )
-    print(f"[INFO] Added {len(docs)} chunks to Chroma.")
 
 
-def query_study_notes(question: str, k: int = 5):
+def query_study_notes(question: str):
+    """
+    Retrieve top chunks and generate an answer.
+    We auto-choose k based on how many chunks exist (user doesn't control this).
+    """
     embedder = get_embedder()
+
+    total_docs = collection.count()
+    if total_docs == 0:
+        return (
+            "I don't know based on these notes.",
+            "",
+            [],
+        )
+
+    # Auto choose k (number of chunks to retrieve)
+    # - At most 5
+    # - At least 1
+    # - And not more than total_docs
+    max_k = 5
+    k = min(max_k, max(1, total_docs))
 
     # Embed single question
     q_emb = next(embedder.embed([question])).tolist()
@@ -211,8 +290,8 @@ def query_study_notes(question: str, k: int = 5):
     metas = results["metadatas"][0]
     ids = results["ids"][0]
 
-    context_parts = []
-    chunks = []
+    context_parts: List[str] = []
+    chunks: List[Dict] = []
     for i, d in enumerate(docs):
         meta = metas[i]
         src = meta.get("source_file", "unknown")
@@ -242,7 +321,9 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-    k: int = 5  # frontend already caps to 5, but backend still supports this
+    # k is kept for backwards compatibility with old frontend,
+    # but backend now auto-chooses number of chunks and ignores it.
+    k: int | None = None
 
 
 @app.get("/health")
@@ -253,26 +334,27 @@ async def health():
 @app.post("/build_index")
 async def build_index(files: List[UploadFile] = File(...)):
     """
-    Upload one or more PDFs and build/reset the Chroma index.
-    Encrypted/unreadable PDFs are skipped (not crashing the API).
+    Upload one or more PDFs and build/update the Chroma index.
+
+    Current behavior:
+    - Clears the old index (reset_collection).
+    - Indexes ALL uploaded PDFs together.
     """
     reset_collection()
     docs = build_doc_chunks(files)
     add_documents_to_chroma(docs)
-    return {
-        "message": "Index built",
-        "chunks": len(docs),
-    }
+    return {"message": "Index built", "chunks": len(docs)}
 
 
 @app.post("/ask")
 async def ask(req: AskRequest):
     """
     Ask a question over the uploaded notes.
+    Chunk retrieval count is auto-decided by the backend.
     """
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on the server."}
-    answer, context, chunks = query_study_notes(req.question, req.k)
+    answer, context, chunks = query_study_notes(req.question)
     return {
         "question": req.question,
         "answer": answer,
