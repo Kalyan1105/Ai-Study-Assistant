@@ -56,7 +56,9 @@ collection = client_chroma.get_or_create_collection(name="study_notes")
 
 def generate_answer(context: str, question: str) -> str:
     """
-    Call Groq LLM with retrieved context + question.
+    Call Groq LLM with a *controlled-size* context.
+    Also catches 'request too large' style errors and returns a friendly message
+    instead of crashing the API.
     """
     prompt = f"""
 You are a helpful AI study assistant for a CSE student.
@@ -70,16 +72,30 @@ Context:
 Question: {question}
 """
 
-    resp = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": "You are a helpful study assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=400,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "You are a helpful study assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=300,  # slightly smaller to reduce total token usage
+        )
+        return resp.choices[0].message.content.strip()
+
+    except Exception as e:
+        msg = str(e)
+        # Groq throws a 413 error when tokens/context are too large
+        if "Request too large" in msg or "tokens per minute" in msg:
+            return (
+                "The question plus the retrieved notes are too large for the model "
+                "to answer in a single request. Please ask a more specific question "
+                "or use fewer / smaller PDFs and rebuild the index."
+            )
+        # Re-raise anything else so FastAPI still returns 500 (for truly unexpected issues)
+        raise
+
 
 
 def read_pdf(path: str) -> str:
@@ -256,52 +272,56 @@ def add_documents_to_chroma(docs: List[Dict]):
     )
 
 
-def query_study_notes(question: str):
-    """
-    Retrieve top chunks and generate an answer.
-    We auto-choose k based on how many chunks exist (user doesn't control this).
-    """
+def query_study_notes(question: str, k: int = 5):
     embedder = get_embedder()
-
-    total_docs = collection.count()
-    if total_docs == 0:
-        return (
-            "I don't know based on these notes.",
-            "",
-            [],
-        )
-
-    # Auto choose k (number of chunks to retrieve)
-    # - At most 5
-    # - At least 1
-    # - And not more than total_docs
-    max_k = 5
-    k = min(max_k, max(1, total_docs))
 
     # Embed single question
     q_emb = next(embedder.embed([question])).tolist()
 
+    # We still *ask* Chroma for up to k results, but will truncate further below.
     results = collection.query(query_embeddings=[q_emb], n_results=k)
 
     if not results["documents"]:
         return "I don't know based on these notes.", "", []
 
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    ids = results["ids"][0]
+    all_docs = results["documents"][0]
+    all_metas = results["metadatas"][0]
+    all_ids = results["ids"][0]
 
-    context_parts: List[str] = []
-    chunks: List[Dict] = []
+    # ✅ Hard cap number of chunks actually used in context
+    #   - Even if user or Chroma asks for many, we only feed top N to Groq.
+    MAX_CHUNKS_FOR_CONTEXT = 4
+    n_available = len(all_ids)
+    use_n = min(MAX_CHUNKS_FOR_CONTEXT, n_available)
+
+    docs = all_docs[:use_n]
+    metas = all_metas[:use_n]
+    ids = all_ids[:use_n]
+
+    context_parts = []
+    chunks = []
     for i, d in enumerate(docs):
-        meta = metas[i]
+        meta = metas[i] or {}
         src = meta.get("source_file", "unknown")
         idx = meta.get("chunk_index", -1)
         context_parts.append(f"[Source: {src} | chunk {idx}]\n{d}\n")
         chunks.append({"id": ids[i], "text": d, "metadata": meta})
 
-    context = "\n\n".join(context_parts)
+    # ✅ Build context, then *truncate* to safe size before sending to Groq
+    full_context = "\n\n".join(context_parts)
+
+    MAX_CONTEXT_CHARS = 3500  # ~2–2.5k tokens depending on content
+    if len(full_context) > MAX_CONTEXT_CHARS:
+        context = (
+            full_context[:MAX_CONTEXT_CHARS]
+            + "\n\n[Context truncated due to size to fit model limits.]"
+        )
+    else:
+        context = full_context
+
     answer = generate_answer(context, question)
     return answer, context, chunks
+
 
 
 # -------------------------
