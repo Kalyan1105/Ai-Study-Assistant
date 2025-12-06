@@ -7,3 +7,4 @@ python-dotenv==1.2.1
 groq==0.37.1
 PyPDF2==3.0.1
 python-multipart==0.0.9
+pycryptodome

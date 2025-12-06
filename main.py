@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from PyPDF2 import PdfReader
+from PyPDF2.errors import DependencyError as PdfDependencyError, PdfReadError
 import chromadb
 from fastembed import TextEmbedding
 from groq import Groq
@@ -27,7 +28,7 @@ if not GROQ_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# You can change this to any fastembed-supported model if needed
+# FastEmbed model (ONNX, CPU-friendly)
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
@@ -40,6 +41,7 @@ def get_embedder() -> TextEmbedding:
     return TextEmbedding(model_name=EMBED_MODEL_NAME)
 
 
+# Chroma persistent DB (stored on Render disk)
 CHROMA_DIR = "./chroma_study_db"
 os.makedirs(CHROMA_DIR, exist_ok=True)
 client_chroma = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -76,12 +78,42 @@ Question: {question}
 
 
 def read_pdf(path: str) -> str:
-    reader = PdfReader(path)
-    pages = []
-    for p in reader.pages:
-        text = p.extract_text() or ""
-        pages.append(text)
-    return "\n".join(pages)
+    """
+    Extract full text from a PDF file using PyPDF2.
+
+    - If the PDF is encrypted and can't be decrypted (AES, password-protected, etc.),
+      we don't crash the app. We log and return empty text.
+    """
+    try:
+        reader = PdfReader(path)
+
+        # Handle encrypted PDFs
+        if reader.is_encrypted:
+            try:
+                # Many "encrypted" PDFs are decryptable with an empty password
+                decrypt_result = reader.decrypt("")
+                # decrypt_result can be 0/1/2; if 0, decryption failed
+                if decrypt_result == 0:
+                    print(f"[WARN] Encrypted PDF requires a password, skipping: {path}")
+                    return ""
+            except Exception as e:
+                print(f"[WARN] Could not decrypt encrypted PDF {path}: {e}")
+                return ""
+
+        pages = []
+        for p in reader.pages:
+            text = p.extract_text() or ""
+            pages.append(text)
+        return "\n".join(pages)
+
+    except (PdfDependencyError, PdfReadError) as e:
+        # DependencyError: PyCryptodome missing for AES (should be fixed by requirements)
+        # PdfReadError: Corrupted/unreadable PDFs
+        print(f"[ERROR] Could not read PDF {path}: {e}")
+        return ""
+    except Exception as e:
+        print(f"[ERROR] Unexpected error reading PDF {path}: {e}")
+        return ""
 
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> List[str]:
@@ -100,6 +132,7 @@ def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
     doc_id = 0
     for uploaded in files:
         if not uploaded.filename.lower().endswith(".pdf"):
+            print(f"[INFO] Skipping non-PDF file: {uploaded.filename}")
             continue
 
         # Save uploaded file to a temp file
@@ -108,6 +141,12 @@ def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
             tmp_path = tmp.name
 
         full_text = read_pdf(tmp_path)
+
+        # If PDF couldn't be read (encrypted/protected), skip it
+        if not full_text.strip():
+            print(f"[WARN] No text extracted from {uploaded.filename}, skipping.")
+            continue
+
         chunks = chunk_text(full_text)
 
         for idx, chunk in enumerate(chunks):
@@ -137,6 +176,7 @@ def reset_collection():
 
 def add_documents_to_chroma(docs: List[Dict]):
     if not docs:
+        print("[WARN] No documents to add to Chroma (maybe all PDFs were unreadable).")
         return
 
     texts = [d["text"] for d in docs]
@@ -153,12 +193,10 @@ def add_documents_to_chroma(docs: List[Dict]):
         metadatas=metas,
         embeddings=embeddings,
     )
+    print(f"[INFO] Added {len(docs)} chunks to Chroma.")
 
 
 def query_study_notes(question: str, k: int = 5):
-    # Safety clamp for k to avoid weird behavior with very large values
-    k = max(1, min(int(k), 10))
-
     embedder = get_embedder()
 
     # Embed single question
@@ -166,25 +204,16 @@ def query_study_notes(question: str, k: int = 5):
 
     results = collection.query(query_embeddings=[q_emb], n_results=k)
 
-    # Be defensive about missing/empty fields
-    docs_list = results.get("documents") or [[]]
-    metas_list = results.get("metadatas") or [[]]
-    ids_list = results.get("ids") or [[]]
-
-    docs = docs_list[0] or []
-    metas = metas_list[0] or []
-    ids = ids_list[0] or []
-
-    if len(docs) == 0:
+    if not results["documents"]:
         return "I don't know based on these notes.", "", []
 
-    # Ensure we don't index past the shortest list
-    n = min(len(docs), len(metas), len(ids))
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+    ids = results["ids"][0]
 
     context_parts = []
     chunks = []
-    for i in range(n):
-        d = docs[i]
+    for i, d in enumerate(docs):
         meta = metas[i]
         src = meta.get("source_file", "unknown")
         idx = meta.get("chunk_index", -1)
@@ -213,7 +242,7 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-    k: int = 5
+    k: int = 5  # frontend already caps to 5, but backend still supports this
 
 
 @app.get("/health")
@@ -224,12 +253,16 @@ async def health():
 @app.post("/build_index")
 async def build_index(files: List[UploadFile] = File(...)):
     """
-    Upload one or more PDFs and build/update the Chroma index.
+    Upload one or more PDFs and build/reset the Chroma index.
+    Encrypted/unreadable PDFs are skipped (not crashing the API).
     """
     reset_collection()
     docs = build_doc_chunks(files)
     add_documents_to_chroma(docs)
-    return {"message": "Index built", "chunks": len(docs)}
+    return {
+        "message": "Index built",
+        "chunks": len(docs),
+    }
 
 
 @app.post("/ask")
@@ -239,19 +272,10 @@ async def ask(req: AskRequest):
     """
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on the server."}
-
-    try:
-        k = max(1, min(int(req.k), 10))
-        answer, context, chunks = query_study_notes(req.question, k)
-        return {
-            "question": req.question,
-            "answer": answer,
-            "context": context,
-            "chunks": chunks,
-        }
-    except Exception as e:
-        # Return a clean JSON error instead of a 500 HTML page
-        return {
-            "error": "Backend exception while answering question.",
-            "detail": str(e),
-        }
+    answer, context, chunks = query_study_notes(req.question, req.k)
+    return {
+        "question": req.question,
+        "answer": answer,
+        "context": context,
+        "chunks": chunks,
+    }
