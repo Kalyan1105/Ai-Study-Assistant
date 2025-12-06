@@ -46,6 +46,12 @@ os.makedirs(CHROMA_DIR, exist_ok=True)
 client_chroma = chromadb.PersistentClient(path=CHROMA_DIR)
 collection = client_chroma.get_or_create_collection(name="study_notes")
 
+# IMPORTANT:
+# This flag says "has someone built an index in THIS server process?"
+# It starts False every time the app starts, so old persisted data is
+# not considered "ready" until /build_index is called.
+INDEX_READY: bool = False
+
 
 # -------------------------
 # PDF utilities
@@ -176,7 +182,9 @@ def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
 # -------------------------
 
 def reset_collection():
-    """Drop and recreate the 'study_notes' collection."""
+    """Drop and recreate the 'study_notes' collection, and mark index as not ready."""
+    global collection, INDEX_READY
+
     try:
         client_chroma.delete_collection("study_notes")
         print("[CHROMA] Existing collection deleted.")
@@ -184,15 +192,18 @@ def reset_collection():
         # It might not exist yet; ignore.
         pass
 
-    global collection
     collection = client_chroma.get_or_create_collection(name="study_notes")
-    print("[CHROMA] Fresh collection created.")
+    INDEX_READY = False
+    print("[CHROMA] Fresh collection created; INDEX_READY = False.")
 
 
 def add_documents_to_chroma(docs: List[Dict]):
     """Embed and add documents into Chroma collection."""
+    global INDEX_READY
+
     if not docs:
         print("[CHROMA] No docs to add.")
+        INDEX_READY = False
         return
 
     texts = [d["text"] for d in docs]
@@ -209,7 +220,9 @@ def add_documents_to_chroma(docs: List[Dict]):
         metadatas=metas,
         embeddings=embeddings,
     )
-    print(f"[CHROMA] Added {len(docs)} chunks to collection.")
+
+    INDEX_READY = True
+    print(f"[CHROMA] Added {len(docs)} chunks to collection; INDEX_READY = True.")
 
 
 # -------------------------
@@ -330,11 +343,9 @@ def query_study_notes(question: str, k: int = 3):
 
     # Attach IDs back to used chunks
     chunks_with_ids: List[Dict] = []
-    used_ids = set()
     for i, chunk in enumerate(used_chunks):
         if i < len(ids):
             chunk_id = ids[i]
-            used_ids.add(chunk_id)
             chunks_with_ids.append(
                 {"id": chunk_id, "text": chunk["text"], "metadata": chunk["metadata"]}
             )
@@ -377,6 +388,14 @@ async def build_index(files: List[UploadFile] = File(...)):
     reset_collection()
     docs = build_doc_chunks(files)
     add_documents_to_chroma(docs)
+
+    if not docs:
+        return {
+            "message": "No readable text found in the uploaded PDFs. "
+                       "Please check your files and try again.",
+            "chunks": 0,
+        }
+
     return {"message": "Index built", "chunks": len(docs)}
 
 
@@ -387,6 +406,17 @@ async def ask(req: AskRequest):
     """
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on the server."}
+
+    # 🔒 NEW: if no index has been built in this server process,
+    # tell the user to upload PDFs and build the index first.
+    global INDEX_READY
+    if not INDEX_READY:
+        return {
+            "error": (
+                "No notes indexed yet. "
+                "Please upload one or more PDFs and click 'Build / Rebuild Index' first."
+            )
+        }
 
     answer, context, chunks = query_study_notes(req.question, k=req.k)
 
