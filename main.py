@@ -1,39 +1,35 @@
 import os
 import tempfile
 from functools import lru_cache
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from PyPDF2 import PdfReader
+from PyPDF2.errors import DependencyError as PdfDependencyError
 import chromadb
 from fastembed import TextEmbedding
-from groq import Groq
+from groq import Groq, APIStatusError
 from dotenv import load_dotenv
+
 
 # -------------------------
 # Config & Setup
 # -------------------------
 
-load_dotenv()  # local .env; Render uses env vars
+load_dotenv()  # for local dev (.env); Render uses real env vars
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
+    # Don't crash on import in Render logs, but be explicit
     print("WARNING: GROQ_API_KEY not set!")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Embedding model
+# fastembed will download this ONNX model once, then cache it
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-# Chunking / retrieval config (medium chunks)
-CHUNK_SIZE = 260          # medium chunk (≈ 180–220 tokens)
-CHUNK_OVERLAP = 70        # still some continuity
-MAX_TOTAL_CHUNKS = 550    # a bit more chunks allowed (still safe)
-DEFAULT_TOP_K = 4         # 4 best chunks per question
-MAX_CONTEXT_CHARS = 6000  # keep this; protects Groq from 413
 
 
 @lru_cache
@@ -42,180 +38,172 @@ def get_embedder() -> TextEmbedding:
     Lazy-load the embedding model on first use.
     fastembed uses ONNX CPU models (no torch/CUDA) → light & fast for Render.
     """
-    print("[EMBED] Loading fastembed model...")
-    emb = TextEmbedding(model_name=EMBED_MODEL_NAME)
-    print("[EMBED] Model loaded.")
-    return emb
+    return TextEmbedding(model_name=EMBED_MODEL_NAME)
 
 
-# Persistent Chroma DB
 CHROMA_DIR = "./chroma_study_db"
 os.makedirs(CHROMA_DIR, exist_ok=True)
 client_chroma = chromadb.PersistentClient(path=CHROMA_DIR)
 collection = client_chroma.get_or_create_collection(name="study_notes")
 
+# IMPORTANT:
+# This flag says "has someone built an index in THIS server process?"
+# It starts False every time the app starts, so old persisted data is
+# not considered "ready" until /build_index is called.
+INDEX_READY: bool = False
+
 
 # -------------------------
-# Core logic
+# PDF utilities
 # -------------------------
-
-def generate_answer(context: str, question: str) -> str:
-    """
-    Call Groq LLM with retrieved context.
-    We keep context length limited to avoid 413 errors.
-    """
-    # Safety: hard truncate context by characters
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS]
-
-    prompt = f"""
-You are a helpful AI study assistant for a CSE student.
-
-You MUST follow these rules:
-- Answer ONLY using the information in the context.
-- If the answer is not clearly found in the context, reply exactly:
-  "I don't know based on these notes."
-
-Context (from the student's notes):
-{context}
-
-Question: {question}
-"""
-
-    resp = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": "You are a helpful study assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=400,
-    )
-    return resp.choices[0].message.content.strip()
-
 
 def read_pdf(path: str) -> str:
     """
-    Read a PDF into plain text.
-    Handles simple encrypted PDFs by trying empty password.
-    If decryption fails, returns empty string.
+    Read a PDF file into a single text string.
+    - Gracefully skips encrypted / unsupported PDFs (e.g., AES without PyCryptodome).
     """
     try:
         reader = PdfReader(path)
+    except Exception as e:
+        print(f"[PDF] Error opening {path}: {e}")
+        return ""
 
-        # Handle encrypted PDFs (no password)
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")  # try blank password
-            except Exception:
-                print(f"[PDF] Encrypted PDF could not be decrypted: {path}")
-                return ""
+    # Handle encryption (if any)
+    if getattr(reader, "is_encrypted", False):
+        try:
+            # Try empty password (many academic PDFs have blank protection)
+            reader.decrypt("")
+        except Exception as e:
+            print(f"[PDF] Skipping encrypted PDF (can't decrypt): {e}")
+            return ""
 
-        pages = []
+    pages: List[str] = []
+    try:
         for p in reader.pages:
             text = p.extract_text() or ""
             pages.append(text)
-        return "\n".join(pages)
-    except Exception as e:
-        print(f"[PDF] Error reading {path}: {e}")
+    except PdfDependencyError as e:
+        # This happens for AES-encrypted PDFs when PyCryptodome is missing
+        print(f"[PDF] Skipping PDF due to encryption dependency: {e}")
         return ""
+    except Exception as e:
+        print(f"[PDF] Error while reading pages: {e}")
+        return ""
+
+    return "\n".join(pages).strip()
 
 
 def chunk_text(
     text: str,
-    chunk_size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP,
+    max_chars: int = 900,
+    overlap_chars: int = 150,
 ) -> List[str]:
     """
-    Simple word-based chunking with overlap.
+    Character-based chunking:
+    - Smaller chunks → sharper embeddings, fewer tokens per chunk.
+    - Overlap keeps context continuity.
     """
-    words = text.split()
-    chunks: List[str] = []
-    start = 0
+    if not text:
+        return []
 
-    while start < len(words):
-        end = start + chunk_size
-        chunks.append(" ".join(words[start:end]))
-        # next chunk starts a bit before the end (overlap)
-        start += max(chunk_size - overlap, 1)
+    text = text.replace("\r\n", "\n")
+    n = len(text)
+    chunks: List[str] = []
+
+    start = 0
+    while start < n:
+        end = min(start + max_chars, n)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if end == n:
+            break
+
+        # Move back a bit for overlap
+        start = max(0, end - overlap_chars)
 
     return chunks
 
 
 def build_doc_chunks(files: List[UploadFile]) -> List[Dict]:
     """
-    Turn uploaded PDFs into a capped list of text chunks.
-    Applies MAX_TOTAL_CHUNKS to keep index bounded.
+    Turn uploaded PDFs into a list of chunk dicts:
+    {
+        "id": "doc0_chunk3",
+        "text": "...",
+        "metadata": {
+            "source_file": "os_notes.pdf",
+            "chunk_index": 3,
+        },
+    }
     """
     docs: List[Dict] = []
     doc_id = 0
 
     for uploaded in files:
-        if not uploaded.filename.lower().endswith(".pdf"):
-            print(f"[UPLOAD] Skipping non-PDF file: {uploaded.filename}")
+        filename = uploaded.filename or "uploaded.pdf"
+
+        if not filename.lower().endswith(".pdf"):
+            print(f"[UPLOAD] Skipping non-PDF file: {filename}")
             continue
 
-        if len(docs) >= MAX_TOTAL_CHUNKS:
-            print("[INDEX] Reached MAX_TOTAL_CHUNKS, ignoring remaining files.")
-            break
-
-        # Save uploaded file to a temp path
+        # Save uploaded file to a temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(uploaded.file.read())
             tmp_path = tmp.name
 
         full_text = read_pdf(tmp_path)
-        if not full_text.strip():
-            print(f"[INDEX] No text extracted from {uploaded.filename}, skipping.")
+        if not full_text:
+            print(f"[UPLOAD] No text extracted from: {filename}")
             continue
 
         chunks = chunk_text(full_text)
 
         for idx, chunk in enumerate(chunks):
-            if len(docs) >= MAX_TOTAL_CHUNKS:
-                print("[INDEX] Reached MAX_TOTAL_CHUNKS while chunking, stopping.")
-                break
-
             docs.append(
                 {
                     "id": f"doc{doc_id}_chunk{idx}",
                     "text": chunk,
                     "metadata": {
-                        "source_file": uploaded.filename,
+                        "source_file": filename,
                         "chunk_index": idx,
                     },
                 }
             )
-
         doc_id += 1
 
-    print(f"[INDEX] Prepared {len(docs)} chunks from {doc_id} PDFs")
+    print(f"[INDEX] Built {len(docs)} chunks from {doc_id} PDFs")
     return docs
 
 
+# -------------------------
+# ChromaDB helpers
+# -------------------------
+
 def reset_collection():
-    """
-    Drop and recreate the global Chroma collection.
-    Called every time the user clicks Build / Rebuild Index.
-    """
-    global collection
+    """Drop and recreate the 'study_notes' collection, and mark index as not ready."""
+    global collection, INDEX_READY
+
     try:
         client_chroma.delete_collection("study_notes")
         print("[CHROMA] Existing collection deleted.")
     except Exception:
-        print("[CHROMA] No existing collection to delete (first run).")
+        # It might not exist yet; ignore.
+        pass
 
     collection = client_chroma.get_or_create_collection(name="study_notes")
-    print("[CHROMA] Fresh collection created.")
+    INDEX_READY = False
+    print("[CHROMA] Fresh collection created; INDEX_READY = False.")
 
 
 def add_documents_to_chroma(docs: List[Dict]):
-    """
-    Embed and add chunks to Chroma.
-    Obeys MAX_TOTAL_CHUNKS via build_doc_chunks.
-    """
+    """Embed and add documents into Chroma collection."""
+    global INDEX_READY
+
     if not docs:
-        print("[CHROMA] No documents to add.")
+        print("[CHROMA] No docs to add.")
+        INDEX_READY = False
         return
 
     texts = [d["text"] for d in docs]
@@ -223,7 +211,7 @@ def add_documents_to_chroma(docs: List[Dict]):
     metas = [d["metadata"] for d in docs]
 
     embedder = get_embedder()
-    # fastembed returns a generator of numpy arrays → convert to list of lists
+    # fastembed.embed() → generator of numpy arrays
     embeddings = [vec.tolist() for vec in embedder.embed(texts)]
 
     collection.add(
@@ -233,65 +221,136 @@ def add_documents_to_chroma(docs: List[Dict]):
         embeddings=embeddings,
     )
 
-    print(f"[CHROMA] Added {len(texts)} chunks to collection.")
+    INDEX_READY = True
+    print(f"[CHROMA] Added {len(docs)} chunks to collection; INDEX_READY = True.")
 
 
-def query_study_notes(question: str, max_k: int = DEFAULT_TOP_K):
+# -------------------------
+# LLM / Answer generation
+# -------------------------
+
+def _build_limited_context(
+    docs: List[str],
+    metas: List[Dict],
+    max_context_chars: int = 12000,
+) -> Tuple[str, List[Dict]]:
     """
-    Run a similarity search over the indexed notes and ask the LLM.
+    Build a nicely annotated context string, but hard-limit total characters
+    so we don't blow Groq's token limits.
     """
-    total_chunks = collection.count()
-    if total_chunks == 0:
-        # handled again at endpoint level, but keep safe here
-        msg = (
-            "Please upload at least one PDF and build the index "
-            "before asking questions."
-        )
-        return msg, "", []
-
-    k = min(max_k, total_chunks)
-
-    embedder = get_embedder()
-    q_emb = next(embedder.embed([question])).tolist()
-
-    results = collection.query(query_embeddings=[q_emb], n_results=k)
-
-    if not results["documents"] or not results["documents"][0]:
-        return "I don't know based on these notes.", "", []
-
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    ids = results["ids"][0]
-
     context_parts: List[str] = []
-    chunks: List[Dict] = []
-    current_len = 0
+    used_chunks: List[Dict] = []
+    total_chars = 0
 
     for i, d in enumerate(docs):
         meta = metas[i]
         src = meta.get("source_file", "unknown")
         idx = meta.get("chunk_index", -1)
 
-        snippet = f"[Source: {src} | chunk {idx}]\n{d}\n\n"
+        decorated = f"[Source: {src} | chunk {idx}]\n{d}\n\n"
 
-        # Respect MAX_CONTEXT_CHARS
-        if current_len + len(snippet) > MAX_CONTEXT_CHARS:
-            remaining = MAX_CONTEXT_CHARS - current_len
-            if remaining > 0:
-                snippet = snippet[:remaining]
-                context_parts.append(snippet)
-                current_len += len(snippet)
-            print("[CONTEXT] Reached MAX_CONTEXT_CHARS while building context.")
+        if total_chars + len(decorated) > max_context_chars:
+            # Stop adding more chunks once we hit the budget
+            print(f"[CONTEXT] Reached context char limit at chunk {i}.")
             break
 
-        context_parts.append(snippet)
-        current_len += len(snippet)
+        context_parts.append(decorated)
+        used_chunks.append({"text": d, "metadata": meta})
+        total_chars += len(decorated)
 
-        chunks.append({"id": ids[i], "text": d, "metadata": meta})
+    context = "".join(context_parts).strip()
+    return context, used_chunks
 
-    context = "".join(context_parts)
+
+def generate_answer(context: str, question: str) -> str:
+    """
+    Call Groq LLM on the retrieved context.
+    - Includes safety for token limit errors (413).
+    """
+    if not context.strip():
+        return "I don't know based on these notes."
+
+    prompt = f"""
+You are a helpful AI study assistant for a CSE student.
+
+Use ONLY the context below to answer the question.
+If the answer is not clearly present in the context, say exactly:
+"I don't know based on these notes."
+
+Be concise, structured, and clear.
+
+Context:
+{context}
+
+Question: {question}
+"""
+
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "You are a helpful study assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
+        return resp.choices[0].message.content.strip()
+    except APIStatusError as e:
+        print(f"[GROQ] APIStatusError: {e}")
+        # 413 or similar token issue → tell user to narrow question
+        return (
+            "Sorry, this question plus the retrieved notes are too large "
+            "for the current model limits. Please try a more specific question."
+        )
+    except Exception as e:
+        print(f"[GROQ] Unexpected error: {e}")
+        return "Sorry, something went wrong while generating the answer."
+
+
+def query_study_notes(question: str, k: int = 3):
+    """
+    Retrieve top-k relevant chunks from Chroma and ask Groq.
+    We also:
+    - Clamp k between 1 and 5 (to avoid huge context).
+    - Hard-limit context size in characters to avoid 413 errors.
+    """
+    max_k = 5
+    k = max(1, min(k, max_k))
+
+    embedder = get_embedder()
+
+    # Embed single question
+    q_emb = next(embedder.embed([question])).tolist()
+
+    results = collection.query(query_embeddings=[q_emb], n_results=k)
+
+    if not results or not results.get("documents"):
+        return "I don't know based on these notes.", "", []
+
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+    ids = results["ids"][0]
+
+    # Build limited context (hard char budget)
+    context, used_chunks = _build_limited_context(
+        docs=docs,
+        metas=metas,
+        max_context_chars=12000,  # ~3000 tokens of context → safe vs 6000 TPM
+    )
+
     answer = generate_answer(context, question)
-    return answer, context, chunks
+
+    # Attach IDs back to used chunks
+    chunks_with_ids: List[Dict] = []
+    for i, chunk in enumerate(used_chunks):
+        if i < len(ids):
+            chunk_id = ids[i]
+            chunks_with_ids.append(
+                {"id": chunk_id, "text": chunk["text"], "metadata": chunk["metadata"]}
+            )
+
+    return answer, context, chunks_with_ids
 
 
 # -------------------------
@@ -302,7 +361,7 @@ app = FastAPI(title="AI Study Assistant API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # relax for testing; tighten later if needed
+    allow_origins=["*"],  # relax for testing; tighten in prod later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -311,84 +370,56 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-
-
-@app.on_event("startup")
-def warmup():
-    """
-    Warmup hook:
-    - Loads embedder
-    - Runs a dummy embedding
-    - Touches the Chroma collection
-    This removes the "first call is slow" feeling.
-    """
-    try:
-        print("[WARMUP] Starting warmup...")
-        emb = get_embedder()
-        _ = list(emb.embed(["warmup"]))
-        _ = collection.count()
-        print("[WARMUP] Warmup complete.")
-    except Exception as e:
-        print(f"[WARMUP] Warmup failed (non-fatal): {e}")
+    # Optional: frontend can still send 'k'; we clamp it internally
+    k: int = 3
 
 
 @app.get("/health")
 async def health():
-    total_chunks = 0
-    try:
-        total_chunks = collection.count()
-    except Exception:
-        pass
-    return {"status": "ok", "chunks_indexed": total_chunks}
+    return {"status": "ok"}
 
 
 @app.post("/build_index")
 async def build_index(files: List[UploadFile] = File(...)):
     """
-    Upload one or more PDFs and build the Chroma index.
+    Upload one or more PDFs and build/update the Chroma index.
     Previous index is cleared each time.
     """
-    if not files:
-        return {"message": "No files uploaded.", "chunks": 0}
-
     reset_collection()
     docs = build_doc_chunks(files)
     add_documents_to_chroma(docs)
 
-    return {
-        "message": "Index built",
-        "chunks": len(docs),
-        "max_chunks": MAX_TOTAL_CHUNKS,
-    }
+    if not docs:
+        return {
+            "message": "No readable text found in the uploaded PDFs. "
+                       "Please check your files and try again.",
+            "chunks": 0,
+        }
+
+    return {"message": "Index built", "chunks": len(docs)}
 
 
 @app.post("/ask")
 async def ask(req: AskRequest):
     """
     Ask a question over the uploaded notes.
-    If no index is built yet, tell the user to upload PDFs first.
     """
     if not GROQ_API_KEY:
         return {"error": "GROQ_API_KEY not configured on the server."}
 
-    try:
-        total = collection.count()
-    except Exception:
-        total = 0
-
-    if total == 0:
-        msg = (
-            "Please upload at least one PDF and click "
-            "'Build / Rebuild Index' before asking questions."
-        )
+    # 🔒 NEW: if no index has been built in this server process,
+    # tell the user to upload PDFs and build the index first.
+    global INDEX_READY
+    if not INDEX_READY:
         return {
-            "question": req.question,
-            "answer": msg,
-            "context": "",
-            "chunks": [],
+            "error": (
+                "No notes indexed yet. "
+                "Please upload one or more PDFs and click 'Build / Rebuild Index' first."
+            )
         }
 
-    answer, context, chunks = query_study_notes(req.question)
+    answer, context, chunks = query_study_notes(req.question, k=req.k)
+
     return {
         "question": req.question,
         "answer": answer,
