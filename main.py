@@ -6,7 +6,7 @@ from typing import List, Dict, Tuple
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+from fastapi import Response
 from PyPDF2 import PdfReader
 from PyPDF2.errors import DependencyError as PdfDependencyError
 import chromadb
@@ -374,9 +374,13 @@ class AskRequest(BaseModel):
     k: int = 3
 
 
-@app.get("/health")
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "ok"}
+    # For HEAD requests the body will be ignored, but status 200 is enough
+    return Response(content='{"status": "ok"}', media_type="application/json")
+
 
 
 @app.post("/build_index")
